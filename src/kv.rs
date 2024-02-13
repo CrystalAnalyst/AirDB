@@ -2,23 +2,97 @@
 #![allow(dead_code)]
 use crate::{KvsError, Result};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    fs::File,
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::PathBuf,
 };
+const COMPACTION_THREASHOLD: u64 = 1024 * 1024;
 
 use serde::{Deserialize, Serialize};
 
 pub struct KvStore {
     // directory for the log and other data
     path: PathBuf,
+    // bufferred IOs
+    readers: HashMap<u64, BufReaderWithPos<File>>,
+    writer: BufWriterWithPos<File>,
+    // metadata
+    current_gen: u64,
+    uncompacted: u64,
+    // in-momery data structure, store the position of logs.
+    index: BTreeMap<String, CommandPos>,
+}
+
+impl KvStore {
+    fn new(_path: PathBuf) -> Self {
+        todo!()
+    }
+
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let cmd = Command::Set { key, value };
+        let pos = self.writer.pos;
+        serde_json::to_writer(&mut self.writer, &cmd)?;
+        self.writer.flush()?;
+        if let Command::Set { key, .. } = cmd {
+            if let Some(old_cmd) = self
+                .index
+                .insert(key, (self.current_gen, pos..self.writer.pos).into())
+            {
+                self.uncompacted += old_cmd.len;
+            }
+        }
+        if self.uncompacted > COMPACTION_THREASHOLD {
+            todo!()
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        if let Some(cmd) = self.index.get(&key) {
+            let reader = self
+                .readers
+                .get_mut(&cmd.gen)
+                .expect("Cannot find log reader");
+            reader.seek(SeekFrom::Start(cmd.pos))?;
+            let cmd_reader = reader.take(cmd.len);
+            if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
+                Ok(Some(value))
+            } else {
+                Err(KvsError::UnexpectedCommandType)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn del(&mut self, key: String) -> Result<()> {
+        if self.index.contains_key(&key) {
+            let cmd = Command::Remove { key };
+            serde_json::to_writer(&mut self.writer, &cmd)?;
+            self.writer.flush()?;
+            if let Command::Remove { key } = cmd {
+                if let Some(old_cmd) = self.index.remove(&key) {
+                    self.uncompacted += old_cmd.len;
+                }
+            }
+            Ok(())
+        } else {
+            Err(KvsError::KeyNotFound)
+        }
+    }
+
+    fn compact() -> Result<()> {
+        todo!()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Command {
     Set { key: String, value: String },
     Get { key: String },
+    Remove { key: String },
 }
 
 impl Command {
@@ -27,6 +101,9 @@ impl Command {
     }
     fn get(key: String) -> Command {
         Command::Get { key }
+    }
+    fn del(key: String) -> Command {
+        Command::Remove { key }
     }
 }
 
