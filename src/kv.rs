@@ -3,10 +3,10 @@
 use crate::{KvsError, Result};
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::File,
+    fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 const COMPACTION_THREASHOLD: u64 = 1024 * 1024;
 
@@ -83,10 +83,46 @@ impl KvStore {
         }
     }
 
-    fn compact() -> Result<()> {
-        todo!()
+    fn compact(&mut self) -> Result<()> {
+        let _compaction_gen = self.current_gen + 1;
+        self.current_gen += 2;
+        self.writer = self.new_file_log(self.current_gen)?;
+        self.uncompacted = 0;
+        Ok(())
+    }
+
+    fn new_file_log(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
+        new_file_log(&self.path, gen, &mut self.readers)
     }
 }
+
+/*----------------------------Aux functions--------------------------------- */
+fn new_log_path(dir: &Path, gen: u64) -> PathBuf {
+    dir.join(format!("{}.log", gen))
+}
+
+fn new_file_log(
+    path: &Path,
+    gen: u64,
+    readers: &mut HashMap<u64, BufReaderWithPos<File>>,
+) -> Result<BufWriterWithPos<File>> {
+    let path = new_log_path(&path, gen);
+    let writer = BufWriterWithPos::new(
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&path)?,
+    )?;
+    readers.insert(gen, BufReaderWithPos::new(File::open(&path)?)?);
+    Ok(writer)
+}
+
+fn sorted_gen_list(_path: &Path) -> Result<Vec<u64>> {
+    todo!()
+}
+
+/*-------------------------For Commands (stored in Log)------------------------- */
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Command {
