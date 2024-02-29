@@ -3,7 +3,9 @@
 use crate::{KvsError, Result};
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::{self, File, OpenOptions},
+    ffi::OsStr,
+    fs::{self, read, File, OpenOptions},
+    hash::Hash,
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::{Path, PathBuf},
@@ -11,6 +13,7 @@ use std::{
 const COMPACTION_THREASHOLD: u64 = 1024 * 1024;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Deserializer;
 
 pub struct KvStore {
     // directory for the log and other data
@@ -26,6 +29,35 @@ pub struct KvStore {
 }
 
 impl KvStore {
+    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
+        let path = path.into();
+        fs::create_dir(&path)?;
+
+        let mut readers = HashMap::new();
+        let mut index = BTreeMap::new();
+
+        let gen_list = sorted_gen_list(&path)?;
+        let mut uncompacted = 0;
+
+        for &gen in &gen_list {
+            let mut reader = BufReaderWithPos::new(File::open(new_log_path(&path, gen))?)?;
+            uncompacted += load(gen, &mut reader, &mut index)?;
+            readers.insert(gen, reader);
+        }
+
+        let current_gen = gen_list.last().unwrap_or(&0) + 1;
+        let writer = new_file_log(&path, current_gen, &mut readers)?;
+
+        Ok(KvStore {
+            path,
+            readers,
+            writer,
+            current_gen,
+            index,
+            uncompacted,
+        })
+    }
+
     fn new(_path: PathBuf) -> Self {
         todo!()
     }
@@ -118,9 +150,54 @@ fn new_file_log(
     Ok(writer)
 }
 
-// Returns sorted generation numbers in the given directory.
-fn sorted_gen_list(_path: &Path) -> Result<Vec<u64>> {
-    todo!()
+/// Load the whole log file and store value locations in the index map.
+///
+/// Returns how many bytes can be saved after a compaction
+fn load(
+    gen: u64,
+    reader: &mut BufReaderWithPos<File>,
+    index: &mut BTreeMap<String, CommandPos>,
+) -> Result<u64> {
+    // to make sure we read from the begining of the file.
+    let mut pos = reader.seek(SeekFrom::Start(0))?;
+    let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
+    let mut uncompacted = 0;
+    while let Some(cmd) = stream.next() {
+        let new_pos = stream.byte_offset() as u64;
+        match cmd? {
+            Command::Set { key, .. } => {
+                if let Some(old_cmd) = index.insert(key, (gen, pos..new_pos).into()) {
+                    uncompacted += old_cmd.len;
+                }
+            }
+            Command::Remove { key } => {
+                if let Some(old_cmd) = index.remove(&key) {
+                    uncompacted += old_cmd.len;
+                }
+                uncompacted += new_pos - pos;
+            }
+            _ => {}
+        }
+        pos = new_pos;
+    }
+    Ok(uncompacted)
+}
+
+/// Returns sorted generation numbers in the given directory.
+fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
+    let mut gen_list: Vec<u64> = fs::read_dir(&path)?
+        .flat_map(|res| -> Result<_> { Ok(res?.path()) })
+        .filter(|path| path.is_file() && path.extension() == Some("log".as_ref()))
+        .flat_map(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .map(|s| s.trim_end_matches(".log"))
+                .map(str::parse::<u64>)
+        })
+        .flatten()
+        .collect();
+    gen_list.sort_unstable();
+    Ok(gen_list)
 }
 
 /*-------------------------For Commands (stored in Log)------------------------- */
