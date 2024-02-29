@@ -118,6 +118,7 @@ fn new_file_log(
     Ok(writer)
 }
 
+// Returns sorted generation numbers in the given directory.
 fn sorted_gen_list(_path: &Path) -> Result<Vec<u64>> {
     todo!()
 }
