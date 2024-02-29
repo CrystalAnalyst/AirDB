@@ -6,7 +6,7 @@ use std::{
     ffi::OsStr,
     fs::{self, read, File, OpenOptions},
     hash::Hash,
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -46,7 +46,7 @@ impl KvStore {
         }
 
         let current_gen = gen_list.last().unwrap_or(&0) + 1;
-        let writer = new_file_log(&path, current_gen, &mut readers)?;
+        let writer = new_log_file(&path, current_gen, &mut readers)?;
 
         Ok(KvStore {
             path,
@@ -115,16 +115,49 @@ impl KvStore {
         }
     }
 
+    /// Clears stale entries in the log.
     fn compact(&mut self) -> Result<()> {
-        let _compaction_gen = self.current_gen + 1;
+        // increase current_gen by 2, current_gen + 1 is for the compaction file.
+        let compaction_gen = self.current_gen + 1;
         self.current_gen += 2;
-        self.writer = self.new_file_log(self.current_gen)?;
+        self.writer = self.new_log_file(self.current_gen)?;
+
+        let mut compaction_writer = self.new_log_file(compaction_gen)?;
+
+        let mut new_pos = 0;
+        for cmd_pos in &mut self.index.values_mut() {
+            let reader = self
+                .readers
+                .get_mut(&cmd_pos.gen)
+                .expect("cannot find log reader");
+            if reader.pos != cmd_pos.pos {
+                reader.seek(SeekFrom::Start(cmd_pos.pos))?;
+            }
+
+            let mut entry_reader = reader.take(cmd_pos.len);
+            let len = io::copy(&mut entry_reader, &mut compaction_writer)?;
+            *cmd_pos = (compaction_gen, new_pos..new_pos + len).into();
+            new_pos += len;
+        }
+        compaction_writer.flush()?;
+
+        let stale_gens: Vec<_> = self
+            .readers
+            .keys()
+            .filter(|&&gen| gen < compaction_gen)
+            .cloned()
+            .collect();
+        for stale_gen in stale_gens {
+            self.readers.remove(&stale_gen);
+            fs::remove_file(new_log_path(&self.path, stale_gen))?;
+        }
+
         self.uncompacted = 0;
         Ok(())
     }
 
-    fn new_file_log(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
-        new_file_log(&self.path, gen, &mut self.readers)
+    fn new_log_file(&mut self, gen: u64) -> Result<BufWriterWithPos<File>> {
+        new_log_file(&self.path, gen, &mut self.readers)
     }
 }
 
@@ -133,7 +166,7 @@ fn new_log_path(dir: &Path, gen: u64) -> PathBuf {
     dir.join(format!("{}.log", gen))
 }
 
-fn new_file_log(
+fn new_log_file(
     path: &Path,
     gen: u64,
     readers: &mut HashMap<u64, BufReaderWithPos<File>>,
